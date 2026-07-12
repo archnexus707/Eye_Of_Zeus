@@ -12,9 +12,9 @@ Author: arch_nexus707
 
 ![Eye of Zeus demo](docs/media/eye_of_zeus_demo.gif)
 
-| Main menu | Exploitation | SMB / SMBGhost |
+| Main menu | Exploitation | Scope guard |
 | --- | --- | --- |
-| ![main menu](docs/media/01_main_menu.png) | ![exploitation](docs/media/02_exploitation.png) | ![smb smbghost](docs/media/03_smb_smbghost.png) |
+| ![main menu](docs/media/01_main_menu.png) | ![exploitation](docs/media/02_exploitation.png) | ![scope prompt](docs/media/03_scope_prompt.png) |
 
 ## Before you use it
 
