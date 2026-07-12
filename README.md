@@ -51,8 +51,8 @@ have permission to test a target, **do not use this tool against it.**
 ## Usage
 
 ```bash
-git clone https://github.com/<your-user>/EyeOfZeus.git
-cd EyeOfZeus
+git clone https://github.com/archnexus707/Eye_Of_Zeus.git
+cd Eye_Of_Zeus
 chmod +x Eye_Of_Zeus_2.sh
 sudo ./Eye_Of_Zeus_2.sh
 ```
