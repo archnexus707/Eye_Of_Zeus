@@ -1,54 +1,42 @@
-# 👁️ Eye of Zeus
+# Eye of Zeus
 
-A menu-driven network auditing and penetration-testing framework for Linux
-(built and tested on Kali). It wraps common offensive-security tooling —
-discovery, MITM, exploitation, and post-exploitation — behind a single themed
-terminal interface with an animated UI.
+A terminal menu for the network testing tools I reach for most, wired together
+so I don't have to remember every flag. It's a bash front-end that shells out to
+the usual suspects (nmap, bettercap, aircrack-ng, metasploit, hcxtools and
+friends) for discovery, MITM, exploitation and post-exploitation. Built and run
+on Kali.
 
-> **Author:** arch_nexus707 · **Theme:** Debian / Hyprland
+Author: arch_nexus707
 
----
+## Demo
 
-## ⚠️ Legal & Ethical Use — Read First
+![Eye of Zeus demo](docs/media/eye_of_zeus_demo.gif)
 
-**This software is for authorized security testing and education only.**
+| Main menu | Exploitation | WiFi |
+| --- | --- | --- |
+| ![main menu](docs/media/01_main_menu.png) | ![exploitation](docs/media/02_exploitation.png) | ![wifi](docs/media/03_wifi_exploits.png) |
 
-You may use it **only** against systems that you own or for which you have
-**explicit, written permission** to test. Unauthorized scanning, interception,
-access, or attack of networks and devices is **illegal** in most jurisdictions
-(e.g. the U.S. Computer Fraud and Abuse Act, the UK Computer Misuse Act, and
-equivalents worldwide) and can carry serious criminal and civil penalties.
+## Before you use it
 
-The author and contributors accept **no liability** for misuse or damage. By
-using this tool you accept full responsibility for your actions. If you do not
-have permission to test a target, **do not use this tool against it.**
+Only point this at networks and devices you own or have written permission to
+test. Scanning, intercepting or attacking anything else is illegal pretty much
+everywhere (CFAA in the US, Computer Misuse Act in the UK, and so on) and the
+penalties are real. I take no responsibility for what you do with it. No
+permission, no testing. That's the whole rule.
 
----
+## What's in it
 
-## Features
+- Network discovery: ping sweep, deep OS/service scan, ARP scan, WiFi AP discovery
+- MITM: ARP/DNS spoofing, SSL strip, session hijack, captive portal, evil twin
+- Exploitation: SMB/RDP/web exploits, WiFi (handshake, PMKID, WPS, deauth), searchsploit lookup
+- Post-exploitation: persistence, exfil, privilege escalation, lateral movement
 
-| Module | Capabilities |
-| --- | --- |
-| **Network Discovery** | Ping sweep, deep OS/service scan, ARP scan, WiFi AP discovery |
-| **MITM** | ARP/DNS spoofing, SSL strip, session hijack, captive portal, evil twin |
-| **Exploitation** | SMB/RDP/Web exploits, WiFi (handshake, PMKID, WPS, deauth), exploit search |
-| **Post-Exploitation** | Persistence, data exfiltration, privilege escalation, lateral movement |
+Two scripts:
 
-- `Eye_Of_Zeus_2.sh` — the full framework (recommended).
-- `Eye_Of_Zeus.sh` — a lightweight standalone ARP-MITM + traffic-sniff workflow.
+- `Eye_Of_Zeus_2.sh` is the full thing, and what you probably want.
+- `Eye_Of_Zeus.sh` is an older standalone ARP-MITM + sniffing workflow.
 
-## Requirements
-
-- Linux (Kali recommended), run as **root**.
-- The scripts check for their dependencies on launch and offer to install the
-  missing ones via `apt`. Core tools include: `nmap`, `bettercap`, `ettercap`,
-  `hydra`, `aircrack-ng`, `metasploit-framework`, `hcxtools`, `dsniff`,
-  `dnsmasq`, `hostapd`, `sslstrip`, and the Python packages `scapy`,
-  `requests`, `beautifulsoup4`.
-- A running X display is required for `Eye_Of_Zeus.sh` (it opens `xterm`
-  windows); it will not work over a plain SSH session.
-
-## Usage
+## Running it
 
 ```bash
 git clone https://github.com/archnexus707/Eye_Of_Zeus.git
@@ -57,19 +45,30 @@ chmod +x Eye_Of_Zeus_2.sh
 sudo ./Eye_Of_Zeus_2.sh
 ```
 
-Navigate the numbered menus. Long-running attacks (ARP spoof, SSL strip,
-captive portal, evil twin, deauth) run until you press **Ctrl+C**, which cleans
-up (restores IP forwarding, removes iptables rules, stops monitor mode) and
-returns you to the menu.
+Needs root and Kali (or something close). On first launch it checks for the
+tools it uses and offers to `apt install` whatever's missing. `Eye_Of_Zeus.sh`
+also opens `xterm` windows, so it needs an X display and won't work over plain
+SSH.
 
-## Notes & Caveats
+Everything is numbered menus. The long-running attacks (ARP spoof, SSL strip,
+captive portal, evil twin, deauth) keep going until you hit Ctrl+C, which puts
+things back (IP forwarding off, iptables rules removed, monitor mode stopped)
+and drops you back at the menu.
 
-- Several modules depend on tool versions and file paths that vary between Kali
-  releases (e.g. `hcxdumptool` flags, exploit-DB script paths, wordlist
-  locations under `/usr/share/wordlists`). Verify these on your system.
-- `sslstrip` is Python 2 and has been dropped from recent Kali; prefer
-  `bettercap`'s SSL-strip caplet if it is unavailable.
+## A few things worth knowing
+
+- The PMKID capture is written for hcxdumptool 6.3.0 and up, including 7.x. That
+  means BPF filters (`--bpf`) and `--rds` for the live view, and letting
+  hcxdumptool own the interface, so don't put the card into monitor mode first.
+  Older builds used `--filterlist_ap` and `--enable_status`, which is what the
+  script used to do before this broke on newer Kali.
+- The SMBGhost exploit path is looked up with `searchsploit -p` at runtime
+  instead of being hardcoded, since exploit-db moves things around between
+  releases. Wordlists under `/usr/share/wordlists` still shift around, so check
+  those yourself.
+- `sslstrip` is Python 2 and recent Kali dropped it. If it's gone, use
+  bettercap's SSL-strip caplet instead.
 
 ## License
 
-Released under the [MIT License](LICENSE).
+MIT. See [LICENSE](LICENSE).
