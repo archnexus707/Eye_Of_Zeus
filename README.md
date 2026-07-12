@@ -12,9 +12,9 @@ Author: arch_nexus707
 
 ![Eye of Zeus demo](docs/media/eye_of_zeus_demo.gif)
 
-| Main menu | Exploitation | WiFi |
+| Main menu | Exploitation | SMB / SMBGhost |
 | --- | --- | --- |
-| ![main menu](docs/media/01_main_menu.png) | ![exploitation](docs/media/02_exploitation.png) | ![wifi](docs/media/03_wifi_exploits.png) |
+| ![main menu](docs/media/01_main_menu.png) | ![exploitation](docs/media/02_exploitation.png) | ![smb smbghost](docs/media/03_smb_smbghost.png) |
 
 ## Before you use it
 
