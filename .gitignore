@@ -1,0 +1,17 @@
+# Scan / capture output generated at runtime
+netdiscover_output.txt
+network_scan_*.txt
+deep_scan_*.txt
+arp_scan_*.txt
+wifi_scan_*.txt
+handshake*
+pmkid*.pcapng
+pmkid_hash
+*.ccache
+*.cap
+*.pcap
+*.pcapng
+
+# Temp artifacts
+/tmp/eoz_*
+*.log
