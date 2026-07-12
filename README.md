@@ -30,6 +30,36 @@ permission, no testing. That's the whole rule.
 - MITM: ARP/DNS spoofing, SSL strip, session hijack, captive portal, evil twin
 - Exploitation: SMB/RDP/web exploits, WiFi (handshake, PMKID, WPS, deauth), searchsploit lookup
 - Post-exploitation: persistence, exfil, privilege escalation, lateral movement
+- Session & report: engagement folder, Markdown report, self-update
+
+Every target you type is validated (IP/CIDR/MAC) before it goes anywhere near a
+command, and it's checked against a scope allowlist first (see below). WiFi
+captures get dropped straight into the engagement folder and you're offered a
+hashcat/aircrack crack right after.
+
+## Scope and output
+
+Attacks are refused unless the target is in scope. Put your authorized targets
+in `scope.txt` next to the script (copy `scope.txt.example` to start), one per
+line — IPs, CIDRs, or BSSIDs. Point somewhere else with `--scope FILE`, or drop
+the check entirely with `--no-scope` if you know what you're doing. With no
+scope file the tool asks for confirmation on every target instead of silently
+allowing it.
+
+Each run creates an engagement folder under `~/EyeOfZeus-loot/<timestamp>/` with
+`scans/`, `hashes/`, `handshakes/`, `creds/`, `reports/` and a full session log.
+The Session & Report menu builds a Markdown summary of everything collected.
+
+Flags:
+
+```
+-h, --help        show help
+-V, --version     show version
+    --update      git pull the latest version
+    --scope FILE  use FILE as the scope allowlist
+    --no-scope    disable scope enforcement
+    --loot DIR    base directory for engagement output
+```
 
 Two scripts:
 

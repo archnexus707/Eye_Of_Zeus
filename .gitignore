@@ -15,3 +15,7 @@ pmkid_hash
 # Temp artifacts
 /tmp/eoz_*
 *.log
+
+# Per-engagement output and the operator's real scope file
+EyeOfZeus-loot/
+scope.txt
